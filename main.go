@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -9,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +18,9 @@ import (
 )
 
 type appConfig struct {
-	RedirectURL string `yaml:"redirect_url"`
+	RedirectURL           string `yaml:"redirect_url"`
+	SourceCalendarID      string `yaml:"source_calendar_id"`
+	DestinationCalendarID string `yaml:"destination_calendar_id"`
 }
 
 func loadConfig(path string) (*appConfig, error) {
@@ -34,6 +34,12 @@ func loadConfig(path string) (*appConfig, error) {
 	}
 	if c.RedirectURL == "" {
 		return nil, fmt.Errorf("%s: redirect_url is required", path)
+	}
+	if c.SourceCalendarID == "" {
+		return nil, fmt.Errorf("%s: source_calendar_id is required", path)
+	}
+	if c.DestinationCalendarID == "" {
+		return nil, fmt.Errorf("%s: destination_calendar_id is required", path)
 	}
 	return &c, nil
 }
@@ -124,25 +130,6 @@ func checkAuthorization(srv *calendar.Service) {
 	}
 }
 
-// listCalendars prints available calendars with their IDs.
-func listCalendars(srv *calendar.Service) {
-	fmt.Println("Available calendars:")
-	pageToken := ""
-	for {
-		resp, err := srv.CalendarList.List().PageToken(pageToken).Do()
-		if err != nil {
-			log.Fatalf("Unable to retrieve calendar list: %v", err)
-		}
-		for _, entry := range resp.Items {
-			fmt.Printf("%-40s %s\n", entry.Id, entry.Summary)
-		}
-		if resp.NextPageToken == "" {
-			break
-		}
-		pageToken = resp.NextPageToken
-	}
-}
-
 // syncEvents copies or updates events from sourceCal to destCal since `since`.
 func syncEvents(srv *calendar.Service, sourceCal, destCal string, since time.Time) {
 	evList, err := srv.Events.List(sourceCal).
@@ -229,52 +216,21 @@ func main() {
 	}
 	checkAuthorization(svc)
 
-	// Select calendars
-	listCalendars(svc)
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Enter source calendar ID: ")
-	srcID, _ := reader.ReadString('\n')
-	srcID = strings.TrimSpace(srcID)
-	fmt.Print("Enter destination calendar ID: ")
-	dstID, _ := reader.ReadString('\n')
-	dstID = strings.TrimSpace(dstID)
-	fmt.Printf("Sync from '%s' to '%s'? (y/N): ", srcID, dstID)
-	if ans, _ := reader.ReadString('\n'); strings.ToLower(strings.TrimSpace(ans)) != "y" {
-		fmt.Println("Aborted.")
-		return
-	}
-
-	// Choose mode
+	sinceFlag := flag.String("since", "", "Only sync events updated since this RFC3339 timestamp (default: all)")
 	flag.Parse()
-	mode := flag.String("mode", "1", "Sync mode: 1=all, 2=since")
+
 	since := time.Time{}
-	if *mode == "2" {
-		def := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
-		fmt.Printf("Timestamp (RFC3339, default %s): ", def)
-		inp, _ := reader.ReadString('\n')
-		inp = strings.TrimSpace(inp)
-		if inp == "" {
-			inp = def
-		}
-		parsed, err := time.Parse(time.RFC3339, inp)
+	if *sinceFlag != "" {
+		parsed, err := time.Parse(time.RFC3339, *sinceFlag)
 		if err != nil {
-			log.Fatalf("Bad timestamp: %v", err)
+			log.Fatalf("Bad --since timestamp: %v", err)
 		}
 		since = parsed
 	}
 
-	// Initial sync
+	srcID := cfg.SourceCalendarID
+	dstID := cfg.DestinationCalendarID
+	log.Printf("Syncing from %q to %q", srcID, dstID)
 	syncEvents(svc, srcID, dstID, since)
-	log.Println("Initial sync completed.")
-
-	// Schedule daily sync every 24h
-	lastSync := time.Now()
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for range ticker.C {
-		log.Println("Running scheduled daily sync...")
-		syncEvents(svc, srcID, dstID, lastSync)
-		lastSync = time.Now()
-		log.Println("Daily sync completed.")
-	}
+	log.Println("Sync completed.")
 }
