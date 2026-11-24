@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -44,17 +46,6 @@ func loadConfig(path string) (*appConfig, error) {
 	return &c, nil
 }
 
-// getClient retrieves a token, saves it, and returns an HTTP client.
-func getClient(config *oauth2.Config) *http.Client {
-	tokFile := "token.json"
-	tok, err := tokenFromFile(tokFile)
-	if err != nil {
-		tok = getTokenFromWeb(config)
-		saveToken(tokFile, tok)
-	}
-	return config.Client(context.Background(), tok)
-}
-
 // tokenFromFile reads a token from a file.
 func tokenFromFile(file string) (*oauth2.Token, error) {
 	f, err := os.Open(file)
@@ -70,14 +61,23 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 // getTokenFromWeb starts a Gin server with OAuth routes and returns a token.
 // Does NOT override the RedirectURL in config; uses what’s in credentials.json.
 func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	codeCh := make(chan string)
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		log.Fatal(err)
+	}
+	state := hex.EncodeToString(stateBytes)
+	authURL := config.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	codeCh := make(chan string, 1)
 
 	r := gin.Default()
 	r.GET("/setup/auth", func(c *gin.Context) {
 		c.Redirect(http.StatusFound, authURL)
 	})
 	r.GET("/setup/auth/callback", func(c *gin.Context) {
+		if c.Query("state") != state {
+			c.String(http.StatusBadRequest, "Invalid OAuth state")
+			return
+		}
 		if errParam := c.Query("error"); errParam != "" {
 			c.String(http.StatusBadRequest, "Authentication failed: %s", errParam)
 			codeCh <- ""
@@ -88,7 +88,7 @@ func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
 		codeCh <- code
 	})
 
-	srv := &http.Server{Addr: ":1853", Handler: r}
+	srv := &http.Server{Addr: "127.0.0.1:1853", Handler: r, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
@@ -114,7 +114,7 @@ func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
 
 // saveToken writes a token to a file.
 func saveToken(path string, token *oauth2.Token) {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		log.Fatalf("Unable to create %s: %v", path, err)
 	}
@@ -122,115 +122,60 @@ func saveToken(path string, token *oauth2.Token) {
 	json.NewEncoder(f).Encode(token)
 }
 
-// checkAuthorization tests the stored token by fetching calendar list.
-func checkAuthorization(srv *calendar.Service) {
-	if _, err := srv.CalendarList.List().MaxResults(1).Do(); err != nil {
-		fmt.Println("Invalid token; remove token.json and rerun to reauthorize.")
-		os.Exit(1)
-	}
-}
-
-// syncEvents copies or updates events from sourceCal to destCal since `since`.
-func syncEvents(srv *calendar.Service, sourceCal, destCal string, since time.Time) {
-	evList, err := srv.Events.List(sourceCal).
-		ShowDeleted(false).
-		SingleEvents(true).
-		UpdatedMin(since.Format(time.RFC3339)).
-		Do()
-	if err != nil {
-		log.Printf("Error listing source events: %v", err)
-		return
-	}
-
-	for _, src := range evList.Items {
-		origID := src.Id
-
-		// look for existing by extended property
-		dq, err := srv.Events.List(destCal).
-			PrivateExtendedProperty("sourceEventId=" + origID).
-			SingleEvents(true).
-			Do()
-		if err == nil && len(dq.Items) > 0 {
-			existing := dq.Items[0]
-
-			// detect changes
-			needsUpdate := false
-			patched := &calendar.Event{}
-			if src.Summary != existing.Summary {
-				patched.Summary = src.Summary
-				needsUpdate = true
-			}
-			if src.Description != existing.Description {
-				patched.Description = src.Description
-				needsUpdate = true
-			}
-			if needsUpdate {
-				log.Printf("Updating event %s: %s", origID, src.Summary)
-				// preserve ext prop
-				if existing.ExtendedProperties == nil {
-					existing.ExtendedProperties = &calendar.EventExtendedProperties{Private: map[string]string{}}
-				}
-				existing.ExtendedProperties.Private["sourceEventId"] = origID
-				patched.ExtendedProperties = existing.ExtendedProperties
-				if _, err := srv.Events.Patch(destCal, existing.Id, patched).Do(); err != nil {
-					log.Printf("Failed to patch event %s: %v", existing.Id, err)
-				}
-			}
-		} else {
-			// insert new
-			src.Id = ""
-			if src.ExtendedProperties == nil {
-				src.ExtendedProperties = &calendar.EventExtendedProperties{Private: map[string]string{}}
-			}
-			src.ExtendedProperties.Private["sourceEventId"] = origID
-			log.Printf("Adding event %s: %q", origID, src.Summary)
-			if _, err := srv.Events.Insert(destCal, src).Do(); err != nil {
-				log.Printf("Failed to insert event for %s: %v", origID, err)
-			}
-		}
-	}
-}
-
 func main() {
-	// Read credentials
-	creds, err := os.ReadFile("credentials.json")
+	configPath := flag.String("config", "config.yaml", "Config file")
+	credentialsPath := flag.String("credentials", "credentials.json", "Google OAuth client JSON")
+	tokenPath := flag.String("token", "token.json", "Google OAuth token JSON (read-only for sync)")
+	authorize := flag.Bool("authorize", false, "Authorize interactively on localhost, save a token, and exit")
+	dryRun := flag.Bool("dry-run", false, "Read calendars and report planned changes without writing")
+	sinceFlag := flag.String("since", "", "Only sync source events updated since this RFC3339 timestamp")
+	timeout := flag.Duration("timeout", 8*time.Minute, "Overall sync timeout")
+	flag.Parse()
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Read credentials.json: %v", err)
+		log.Fatal(err)
+	}
+	if cfg.SourceCalendarID == cfg.DestinationCalendarID {
+		log.Fatal("source and destination must differ")
+	}
+	creds, err := os.ReadFile(*credentialsPath)
+	if err != nil {
+		log.Fatalf("Read OAuth credentials: %v", err)
 	}
 	config, err := google.ConfigFromJSON(creds, calendar.CalendarScope)
 	if err != nil {
-		log.Fatalf("Parse credentials: %v", err)
-	}
-
-	cfg, err := loadConfig("config.yaml")
-	if err != nil {
-		log.Fatalf("Load config: %v", err)
+		log.Fatal(err)
 	}
 	config.RedirectURL = cfg.RedirectURL
-
-	// OAuth2 client
-	client := getClient(config)
-	svc, err := calendar.New(client)
-	if err != nil {
-		log.Fatalf("Create Calendar service: %v", err)
+	if *authorize {
+		saveToken(*tokenPath, getTokenFromWeb(config))
+		return
 	}
-	checkAuthorization(svc)
-
-	sinceFlag := flag.String("since", "", "Only sync events updated since this RFC3339 timestamp (default: all)")
-	flag.Parse()
-
+	tok, err := tokenFromFile(*tokenPath)
+	if err != nil {
+		log.Fatalf("Read token: %v; use --authorize locally first", err)
+	}
+	if tok.RefreshToken == "" {
+		log.Fatal("Token has no refresh token; use --authorize locally first")
+	}
 	since := time.Time{}
 	if *sinceFlag != "" {
-		parsed, err := time.Parse(time.RFC3339, *sinceFlag)
+		since, err = time.Parse(time.RFC3339, *sinceFlag)
 		if err != nil {
 			log.Fatalf("Bad --since timestamp: %v", err)
 		}
-		since = parsed
 	}
-
-	srcID := cfg.SourceCalendarID
-	dstID := cfg.DestinationCalendarID
-	log.Printf("Syncing from %q to %q", srcID, dstID)
-	syncEvents(svc, srcID, dstID, since)
-	log.Println("Sync completed.")
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	client := config.Client(ctx, tok)
+	client.Timeout = 45 * time.Second
+	svc, err := calendar.New(client)
+	if err != nil {
+		log.Fatal(err)
+	}
+	stats, err := syncEvents(ctx, svc, cfg.SourceCalendarID, cfg.DestinationCalendarID, since, *dryRun)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Sync completed (dry_run=%t): created=%d updated=%d unchanged=%d", *dryRun, stats.Created, stats.Updated, stats.Unchanged)
 }
