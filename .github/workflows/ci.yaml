@@ -1,0 +1,35 @@
+name: Test and publish
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - run: go test -race ./...
+      - run: go vet ./...
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Shion1305/k8s-GitOps/.github/actions/harbor-build-push@5f5f0e098b2b8753e27ca85e177e3ea4f9646072
+        id: image
+        with:
+          image: harbor.shion1305.com/shion1305/calendar-sync
+          push: ${{ github.event_name != 'pull_request' }}
+      - if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: printf '%s\n' "$IMAGE_REF" >> "$GITHUB_STEP_SUMMARY"
