@@ -60,7 +60,7 @@ docker run --rm \
   -v "$PWD/config.yaml:/config/config.yaml:ro" \
   -v "$PWD/credentials.json:/secrets/credentials.json:ro" \
   -v "$PWD/token.json:/secrets/token.json:ro" \
-  harbor.i.shion1305.com/shion1305/calendar-sync@sha256:<digest> \
+  harbor.i.shion1305.com/shion1305/calendar-sync:latest \
   --config /config/config.yaml --credentials /secrets/credentials.json \
   --token /secrets/token.json --dry-run
 ```
@@ -68,8 +68,8 @@ docker run --rm \
 CI tests every push/PR. Repository branch pushes and manual runs publish
 commit-SHA tags to Harbor using the shared GitOps build action and GitHub
 OIDC/Vault authentication, then sign the image. PR runs only validate builds.
-No moving `latest` tag is published. Deploy a reviewed digest through
-`Shion1305/k8s-GitOps`; publishing an image does not activate a deployment.
+After signing, CI also tags the current default branch image as `latest`.
+The calendar-sync CronJob in `Shion1305/k8s-GitOps` pulls that tag for each run.
 
 ## Validation
 
