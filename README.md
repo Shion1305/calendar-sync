@@ -65,9 +65,11 @@ docker run --rm \
   --token /secrets/token.json --dry-run
 ```
 
-CI tests every push/PR. Repository branch pushes and manual runs publish
-commit-SHA tags to Harbor using the shared GitOps build action and GitHub
-OIDC/Vault authentication, then sign the image. PR runs only validate builds.
+CI tests every push/PR. Only default-branch pushes and manual runs on the
+default branch publish commit-SHA tags to Harbor using the shared GitOps build
+action and GitHub OIDC/Vault authentication, then sign the image. Other branch
+pushes, branch dispatches and PRs only validate builds. This keeps unreviewed
+branch images from displacing the deployed release under Harbor retention.
 After signing, CI also tags the current default branch image as `latest`.
 The calendar-sync CronJob in `Shion1305/k8s-GitOps` pulls that tag for each run.
 
