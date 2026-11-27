@@ -30,7 +30,8 @@ jobs:
         id: image
         with:
           image: harbor.shion1305.com/shion1305/calendar-sync
-          push: ${{ github.event_name != 'pull_request' }}
+          # Branch images would displace releases under Harbor's keep-two policy.
+          push: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Publish latest from the current default branch
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         shell: bash
@@ -42,7 +43,7 @@ jobs:
             crane tag "$IMAGE_REF" latest
             test "$(crane digest "${IMAGE_REF%@*}:latest")" = "${IMAGE_REF#*@}"
           fi
-      - if: github.event_name != 'pull_request'
+      - if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: printf '%s\n' "$IMAGE_REF" >> "$GITHUB_STEP_SUMMARY"
